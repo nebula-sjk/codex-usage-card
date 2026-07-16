@@ -51,7 +51,7 @@ jobs:
             -output 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
           chmod +x 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
           cp Resources/Info.plist 'build/Codex使用量卡片.app/Contents/Info.plist'
-          lipo -verify_arch arm64 x86_64 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
+          lipo 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard' -verify_arch arm64 x86_64
       - name: Create macOS DMG and ZIP
         env:
           CODEX_SKIP_BUILD: "1"
