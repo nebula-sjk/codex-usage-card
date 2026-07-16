@@ -4,6 +4,10 @@
 # Local build products
 /build/
 /dist/
+/.planning/
+/windows/build/
+/windows/dist/
+/windows/__pycache__/
 
 # Xcode / SwiftPM user state
 DerivedData/

@@ -8,17 +8,97 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: macos-latest
+  macos-build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build release archive
+      - name: Build native macOS binary
+        env:
+          CODEX_BUILD_ARCHS: ${{ matrix.architecture }}
+        run: ./scripts/build.sh
+      - name: Upload thin binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.architecture }}
+          path: build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard
+
+  macos-package:
+    needs: macos-build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: build/release/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-x86_64
+          path: build/release/x86_64
+      - name: Assemble universal application
+        run: |
+          mkdir -p 'build/Codex使用量卡片.app/Contents/MacOS'
+          lipo -create \
+            build/release/arm64/CodexUsageCard \
+            build/release/x86_64/CodexUsageCard \
+            -output 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
+          chmod +x 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
+          cp Resources/Info.plist 'build/Codex使用量卡片.app/Contents/Info.plist'
+          lipo -verify_arch arm64 x86_64 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard'
+      - name: Create macOS DMG and ZIP
+        env:
+          CODEX_SKIP_BUILD: "1"
         run: ./scripts/package.sh
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: |
+            dist/CodexUsageCard-macos-universal.dmg
+            dist/CodexUsageCard-macos.zip
+
+  windows-package:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress --yes
+      - name: Build Windows executable and installer
+        shell: pwsh
+        run: ./windows/build.ps1 -Installer -Version "${{ github.ref_name }}"
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            dist/CodexUsageCard-windows-x64.exe
+            dist/CodexUsageCard-windows-x64-setup.exe
+
+  publish:
+    needs: [macos-package, windows-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-packages"
+          path: release-assets
+          merge-multiple: true
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          "dist/CodexUsageCard-macos.zip"
+          release-assets/*
+          --repo "$GITHUB_REPOSITORY"
           --title "$GITHUB_REF_NAME"
           --generate-notes

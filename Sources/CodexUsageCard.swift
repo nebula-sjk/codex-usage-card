@@ -212,7 +212,7 @@ private final class UsageReader {
         let escaped = NSRegularExpression.escapedPattern(for: key)
         let patterns = [
             "\\\"" + escaped + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
-            escaped + "\\s*[=:]\\s*\\\"?([^,}\\\"\\s]+)"
+            escaped + "\\s*(?:=>|[=:])\\s*\\\"?([^,}\\\"\\s]+)"
         ]
         let rawValues = patterns.flatMap { pattern -> [String] in
             guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
@@ -236,7 +236,7 @@ private final class UsageReader {
         let escaped = NSRegularExpression.escapedPattern(for: key)
         let patterns = [
             "\\\"" + escaped + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
-            escaped + "\\s*[=:]\\s*\\\"?([^,}\\\"\\s]+)"
+            escaped + "\\s*(?:=>|[=:])\\s*\\\"?([^,}\\\"\\s]+)"
         ]
 
         for pattern in patterns {
@@ -807,12 +807,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let expanded = defaultExpandedFrame()
         window.setFrame(expanded, display: false)
+        content.isCollapsed = !startsExpandedForPreview
+        window.setFrame(startsExpandedForPreview ? expanded : collapsedFrame(from: expanded), display: false)
+        window.displayIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
-        content.isCollapsed = !startsExpandedForPreview
-        window.setFrame(startsExpandedForPreview ? expanded : collapsedFrame(from: expanded), display: true)
-        window.displayIfNeeded()
     }
 
     private func writePreviewScreenshot() {
@@ -915,16 +915,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         codexWindowVisible = visible
 
         if visible {
+            repairCollapsedWindowInvariant()
+            window.displayIfNeeded()
             window.orderFrontRegardless()
         } else {
+            // Remove the panel before changing content/geometry so WindowServer
+            // never paints the compact orb in an expanded frame.
+            window.orderOut(nil)
             expandWorkItem?.cancel()
             expandWorkItem = nil
             collapseWorkItem?.cancel()
             collapseWorkItem = nil
-            if let content = window.contentView as? CardView, !content.isCollapsed {
-                setCollapsed(true)
-            }
-            window.orderOut(nil)
+            setCollapsed(true)
         }
     }
 
@@ -975,22 +977,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setCollapsed(_ collapsed: Bool) {
         guard let content = window.contentView as? CardView else { return }
-        if content.isCollapsed == collapsed { return }
-
-        let targetFrame: NSRect
         if collapsed {
-            content.isCollapsed = true
             window.resizingEnabled = false
-            targetFrame = collapsedFrame(from: window.frame)
-        } else {
-            content.isCollapsed = false
-            window.resizingEnabled = true
-            targetFrame = expandedFrame(from: window.frame)
+            // Geometry first, content state second. Reversing this order lets
+            // drawOrb() render inside the previous 320 x 200 frame as an oval.
+            window.setFrame(collapsedFrame(from: window.frame), display: false)
+            if !content.isCollapsed {
+                content.isCollapsed = true
+            }
+            window.displayIfNeeded()
+            return
         }
 
-        // Entering may animate for spatial continuity; exiting is immediate
-        // so the compact card never lingers visibly after the pointer leaves.
-        let duration: TimeInterval = collapsed || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.22
+        guard content.isCollapsed else { return }
+        content.isCollapsed = false
+        window.resizingEnabled = true
+        let targetFrame = expandedFrame(from: window.frame)
+        let duration: TimeInterval = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.22
         if duration == 0 {
             window.setFrame(targetFrame, display: true)
         } else {
@@ -999,6 +1002,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.animator().setFrame(targetFrame, display: true)
             }
         }
+    }
+
+    private func repairCollapsedWindowInvariant() {
+        guard let content = window.contentView as? CardView, content.isCollapsed else { return }
+        let size = window.frame.size
+        let epsilon: CGFloat = 0.5
+        guard abs(size.width - ballSize.width) > epsilon ||
+                abs(size.height - ballSize.height) > epsilon else { return }
+        window.resizingEnabled = false
+        window.setFrame(collapsedFrame(from: window.frame), display: false)
     }
 
     private func refresh() {

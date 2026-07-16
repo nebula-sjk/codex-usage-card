@@ -1,4 +1,4 @@
-name: Build macOS app
+name: Build applications
 
 on:
   push:
@@ -7,14 +7,43 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    runs-on: macos-latest
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build application
-        run: ./scripts/build.sh
-      - name: Upload app bundle
+      - name: Build macOS application
+        env:
+          CODEX_BUILD_ARCHS: ${{ matrix.architecture }}
+        run: |
+          ./scripts/build.sh
+          test "$(lipo -archs 'build/Codex使用量卡片.app/Contents/MacOS/CodexUsageCard')" = "$CODEX_BUILD_ARCHS"
+      - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
-          name: Codex-usage-card
+          name: Codex-usage-card-macos-${{ matrix.architecture }}
           path: build/Codex使用量卡片.app
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check Windows source
+        run: python -m py_compile windows/CodexUsageCard.py
+      - name: Build Windows executable
+        shell: pwsh
+        run: ./windows/build.ps1
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Codex-usage-card-windows-x64
+          path: dist/CodexUsageCard-windows-x64.exe
