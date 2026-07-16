@@ -1,0 +1,20 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build application
+        run: ./scripts/build.sh
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Codex-usage-card
+          path: build/Codex使用量卡片.app

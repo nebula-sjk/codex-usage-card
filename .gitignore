@@ -1,0 +1,17 @@
+# macOS Finder metadata
+.DS_Store
+
+# Local build products
+/build/
+/dist/
+
+# Xcode / SwiftPM user state
+DerivedData/
+.build/
+*.xcuserstate
+xcuserdata/
+
+# Local Codex data (never commit personal usage history)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
