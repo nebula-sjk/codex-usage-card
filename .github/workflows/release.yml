@@ -19,6 +19,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          "dist/Codex使用量卡片-macos.zip"
+          "dist/CodexUsageCard-macos.zip"
           --title "$GITHUB_REF_NAME"
           --generate-notes

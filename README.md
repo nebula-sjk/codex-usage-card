@@ -57,7 +57,7 @@ open "build/Codex使用量卡片.app"
 
 ## 下载已构建版本
 
-在 GitHub 的 **Releases** 页面下载 `Codex使用量卡片-macos.zip`，解压后双击应用即可使用。
+在 GitHub 的 **Releases** 页面下载 `CodexUsageCard-macos.zip`，解压后双击应用即可使用。
 
 当前公开构建尚未经过 Apple 签名和公证。若 macOS 阻止首次打开，请在 Finder 中按住 Control 点击应用，选择“打开”，再确认一次即可。你也可以直接从源码构建，以获得本机生成的应用包。
 
