@@ -73,6 +73,151 @@ private final class UsageReader {
         if let preview = previewSnapshot() {
             return preview
         }
+        if let live = readFromAppServer() {
+            return live
+        }
+        return readFromLegacyLog()
+    }
+
+    private func readFromAppServer() -> UsageSnapshot? {
+        guard let executable = codexExecutableURL() else { return nil }
+
+        let process = Process()
+        let outputPipe = Pipe()
+        let inputPipe = Pipe()
+        process.executableURL = executable
+        process.arguments = ["app-server", "--stdio"]
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = FileHandle.nullDevice
+
+        let responseReady = DispatchSemaphore(value: 0)
+        let responseLock = NSLock()
+        var responseResult: [String: Any]?
+        var responseBuffer = Data()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            responseLock.lock()
+            responseBuffer.append(data)
+            while let newline = responseBuffer.firstIndex(of: 0x0A) {
+                let line = responseBuffer[..<newline]
+                responseBuffer.removeSubrange(...newline)
+                guard responseResult == nil,
+                      let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                      (object["id"] as? NSNumber)?.intValue == 2,
+                      let result = object["result"] as? [String: Any] else { continue }
+                responseResult = result
+                responseReady.signal()
+            }
+            responseLock.unlock()
+        }
+
+        let initialize: [String: Any] = [
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "clientInfo": [
+                    "name": "codex-usage-card",
+                    "title": "Codex Usage Card",
+                    "version": "1.0.0"
+                ],
+                "capabilities": ["experimentalApi": true]
+            ]
+        ]
+        let request: [String: Any] = [
+            "id": 2,
+            "method": "account/rateLimits/read",
+            "params": NSNull()
+        ]
+
+        do {
+            try process.run()
+            for message in [initialize, request] {
+                let data = try JSONSerialization.data(withJSONObject: message)
+                inputPipe.fileHandleForWriting.write(data)
+                inputPipe.fileHandleForWriting.write(Data([0x0A]))
+            }
+            let waitResult = responseReady.wait(timeout: .now() + 8)
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            try? inputPipe.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+
+            guard waitResult == .success else { return nil }
+            responseLock.lock()
+            let result = responseResult
+            responseLock.unlock()
+            if let result { return snapshot(from: result) }
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            if process.isRunning { process.terminate() }
+            return nil
+        }
+        return nil
+    }
+
+    private func snapshot(from result: [String: Any]) -> UsageSnapshot? {
+        let buckets = result["rateLimitsByLimitId"] as? [String: Any]
+        let rateLimits = (buckets?["codex"] as? [String: Any])
+            ?? (result["rateLimits"] as? [String: Any])
+        guard let rateLimits else { return nil }
+
+        let primary = rateLimits["primary"] as? [String: Any]
+        let secondary = rateLimits["secondary"] as? [String: Any]
+        let primaryWindow = (primary?["windowDurationMins"] as? NSNumber)?.intValue ?? 0
+        let secondaryWindow = (secondary?["windowDurationMins"] as? NSNumber)?.intValue ?? 0
+        let weekly: [String: Any]?
+        if primaryWindow >= 10_000 {
+            weekly = primary
+        } else if secondaryWindow >= 10_000 {
+            weekly = secondary
+        } else {
+            weekly = primaryWindow >= secondaryWindow ? primary : secondary
+        }
+        guard let weekly,
+              let weeklyUsed = (weekly["usedPercent"] as? NSNumber)?.intValue else { return nil }
+
+        let resetCredits = result["rateLimitResetCredits"] as? [String: Any]
+        let resetsAvailable = (resetCredits?["availableCount"] as? NSNumber)?.intValue ?? 0
+        let credits = resetCredits?["credits"] as? [[String: Any]] ?? []
+        let now = Int(Date().timeIntervalSince1970)
+        let resetCardExpiryAt = credits.compactMap { credit -> Int? in
+            guard (credit["status"] as? String) == "available",
+                  let expiresAt = (credit["expiresAt"] as? NSNumber)?.intValue,
+                  expiresAt > now else { return nil }
+            return expiresAt
+        }.min() ?? 0
+
+        return UsageSnapshot(
+            weeklyUsed: weeklyUsed,
+            weeklyResetAfter: 0,
+            weeklyResetAt: (weekly["resetsAt"] as? NSNumber)?.intValue ?? 0,
+            resetsAvailable: resetsAvailable,
+            resetCardExpiryAt: resetCardExpiryAt,
+            plan: (rateLimits["planType"] as? String)?.capitalized ?? "Codex",
+            sampledAt: Date()
+        )
+    }
+
+    private func codexExecutableURL() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var candidates = [
+            "\(home)/.npm-global/bin/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            "/usr/bin/codex"
+        ]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map { "\($0)/codex" })
+        }
+        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func readFromLegacyLog() -> UsageSnapshot? {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
@@ -80,7 +225,8 @@ private final class UsageReader {
             "-readonly",
             databasePath,
             "SELECT feedback_log_body FROM logs " +
-            "WHERE ((feedback_log_body LIKE '%\"x-codex-primary-window-minutes\":%' " +
+            "WHERE target IN ('codex_http_client::default_client', 'codex_client::default_client') " +
+            "AND ((feedback_log_body LIKE '%\"x-codex-primary-window-minutes\":%' " +
             "AND feedback_log_body LIKE '%\"x-codex-primary-used-percent\":%') " +
             "OR (feedback_log_body LIKE '%x-codex-primary-window-minutes =>%' " +
             "AND feedback_log_body LIKE '%x-codex-primary-used-percent =>%')) " +
@@ -136,9 +282,7 @@ private final class UsageReader {
                 "rate_limit_reset_available",
                 "resets_available"
             ]
-            // The current response headers do not expose this UI-only count.
-            // Keep the value shown by the user's official panel until a future field appears.
-            let resetsAvailable = resetKeys.compactMap { intValue(for: $0, in: text) }.first ?? 1
+            let resetsAvailable = resetKeys.compactMap { intValue(for: $0, in: text) }.first ?? 0
             let resetCardExpiryKeys = [
                 "x-codex-usage-reset-expiry",
                 "x-codex-usage-reset-expires-at",
@@ -168,7 +312,7 @@ private final class UsageReader {
             let resetCardExpiryAt = resetCardExpiryKeys
                 .flatMap { timestampValues(for: $0, in: text) }
                 .filter { $0 > 0 }
-                .min() ?? officialPanelFallbackExpiryAt()
+                .min() ?? 0
             let plan = capture("x-codex-plan-type", in: text)?.capitalized ?? "Codex"
 
             return UsageSnapshot(
@@ -248,22 +392,6 @@ private final class UsageReader {
             }
         }
         return nil
-    }
-
-    private func officialPanelFallbackExpiryAt() -> Int {
-        // The response headers currently omit reset-card expiry. Retain the
-        // latest verified official-panel value only until that date passes;
-        // a future server value always takes precedence.
-        var components = DateComponents()
-        components.calendar = Calendar.current
-        components.timeZone = TimeZone.current
-        components.year = 2026
-        components.month = 8
-        components.day = 13
-        components.hour = 23
-        components.minute = 59
-        guard let date = components.date, date > Date() else { return 0 }
-        return Int(date.timeIntervalSince1970)
     }
 
 }
@@ -702,8 +830,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var collapseWorkItem: DispatchWorkItem?
     private var expandWorkItem: DispatchWorkItem?
     private var isPointerDown = false
+    private var isRefreshing = false
     private let startsExpandedForPreview = ProcessInfo.processInfo.environment["CODEX_USAGE_CARD_PREVIEW_EXPANDED"] == "1"
     private let previewScreenshotPath = ProcessInfo.processInfo.environment["CODEX_USAGE_CARD_PREVIEW_SCREENSHOT_PATH"]
+    private let previewScreenshotDelay = Double(
+        ProcessInfo.processInfo.environment["CODEX_USAGE_CARD_PREVIEW_SCREENSHOT_DELAY"] ?? ""
+    ) ?? 0.6
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -720,9 +852,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         codexVisibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.50, repeats: true) { [weak self] _ in
             self?.updateCodexWindowVisibility()
         }
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake(_:)),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
         updateCodexWindowVisibility()
         if previewScreenshotPath != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + previewScreenshotDelay) { [weak self] in
                 self?.writePreviewScreenshot()
             }
         }
@@ -732,6 +877,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer?.invalidate()
         hoverTimer?.invalidate()
         codexVisibilityTimer?.invalidate()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     private func buildWindow() {
@@ -953,6 +1099,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pollHoverState() {
+        repairCollapsedWindowInvariant()
         guard !isPointerDown else { return }
         let hovering = window.frame.contains(NSEvent.mouseLocation)
         if hovering {
@@ -990,18 +1137,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard content.isCollapsed else { return }
-        content.isCollapsed = false
         window.resizingEnabled = true
         let targetFrame = expandedFrame(from: window.frame)
-        let duration: TimeInterval = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.22
-        if duration == 0 {
-            window.setFrame(targetFrame, display: true)
-        } else {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = duration
-                window.animator().setFrame(targetFrame, display: true)
-            }
-        }
+        // Keep size changes atomic. Animating width/height can finish after a
+        // fast mouse exit and leave collapsed content in an expanded frame.
+        window.setFrame(targetFrame, display: false)
+        content.isCollapsed = false
+        window.displayIfNeeded()
     }
 
     private func repairCollapsedWindowInvariant() {
@@ -1015,10 +1157,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let snapshot = self.reader.read()
             DispatchQueue.main.async {
+                self.isRefreshing = false
                 if let snapshot { self.apply(snapshot) }
                 else {
                     self.lastUpdateText = "暂未找到最新用量，打开 Codex 后会自动同步"
@@ -1026,6 +1171,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc private func workspaceDidWake(_ notification: Notification) {
+        repairCollapsedWindowInvariant()
+        let visible = hasVisibleCodexWindow()
+        codexWindowVisible = visible
+        if visible {
+            window.displayIfNeeded()
+            window.orderFrontRegardless()
+        } else {
+            window.orderOut(nil)
+            setCollapsed(true)
+        }
+        refresh()
     }
 
     private func apply(_ snapshot: UsageSnapshot) {
